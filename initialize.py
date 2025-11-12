@@ -6,24 +6,24 @@
 # ライブラリの読み込み
 ############################################################
 import os
-from pathlib import Path
+import sys
 import logging
+import tempfile
+import unicodedata
+from pathlib import Path
 from logging.handlers import TimedRotatingFileHandler
 from uuid import uuid4
-import sys
-import unicodedata
-from dotenv import load_dotenv
-import streamlit as st
 
-# ★ 文字コード問題を吸収するために追加
+import streamlit as st
 import pandas as pd
-import tempfile
+from dotenv import load_dotenv
 
 from langchain_community.document_loaders.csv_loader import CSVLoader
-from langchain_openai import OpenAIEmbeddings
-from langchain_community.vectorstores import Chroma
 from langchain_community.retrievers import BM25Retriever
+from langchain_community.vectorstores import Chroma
+from langchain_openai import OpenAIEmbeddings
 from langchain.retrievers import EnsembleRetriever
+
 import utils
 import constants as ct
 
@@ -102,11 +102,10 @@ def initialize_retriever():
     Retrieverを作成
     """
     logger = logging.getLogger(ct.LOGGER_NAME)
-
     if "retriever" in st.session_state:
         return
 
-    # --- CSV 読み込み（文字コードを自動判定 → UTF-8に正規化してから Loader に渡す）---
+    # --- CSV 読み込み（文字コードを自動判定 → UTF-8正規化）---
     csv_path = Path(ct.RAG_SOURCE_PATH)
     tried = []
     df = None
@@ -118,47 +117,61 @@ def initialize_retriever():
             tried.append(f"{enc}: {e!s}")
 
     if df is None:
-        logger.error("products.csv を読み込めませんでした。以下のエンコーディングで失敗: " + " / ".join(tried))
+        logger.error(
+            "products.csv を読み込めませんでした。以下のエンコーディングで失敗: " + " / ".join(tried)
+        )
         raise RuntimeError("products.csv の文字コードを UTF-8 へ保存し直してください。")
 
-    # UTF-8 へ正規化して一時ファイルに保存（Loader は UTF-8 を読む）
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False, encoding="utf-8", newline="") as tmp:
-        tmp_path = Path(tmp.name)
-        df.to_csv(tmp_path, index=False, encoding="utf-8")
+    # ==== ここからキャッシュ化（同一セッション＆リランで再構築を防止）====
+    stat = csv_path.stat()
+    # CSVのmtime/size + TOP_K + weights + APIキー有無をシグネチャに
+    sig = f"{stat.st_mtime_ns}:{stat.st_size}:{ct.TOP_K}:{tuple(ct.RETRIEVER_WEIGHTS)}:{bool(os.getenv('OPENAI_API_KEY'))}"
 
-    try:
-        loader = CSVLoader(str(tmp_path), encoding="utf-8")
-        docs = loader.load()
-    finally:
+    @st.cache_resource(show_spinner=False)
+    def _build_retriever(_signature: str):
+        # UTF-8に正規化した一時CSVを作ってCSVLoaderで読む
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False, encoding="utf-8", newline="") as tmp:
+            tmp_path = Path(tmp.name)
+            df.to_csv(tmp_path, index=False, encoding="utf-8")
+
         try:
-            tmp_path.unlink(missing_ok=True)
-        except Exception:
-            pass
+            loader = CSVLoader(str(tmp_path), encoding="utf-8")
+            docs = loader.load()
+        finally:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
 
-    # OSがWindowsの場合、Unicode正規化と、cp932（Windows用の文字コード）で表現できない文字を除去
-    for doc in docs:
-        doc.page_content = adjust_string(doc.page_content)
-        for key in list(doc.metadata.keys()):
-            doc.metadata[key] = adjust_string(doc.metadata[key])
+        # Windowsの化け対策
+        for doc in docs:
+            doc.page_content = adjust_string(doc.page_content)
+            for key in list(doc.metadata.keys()):
+                doc.metadata[key] = adjust_string(doc.metadata[key])
 
-    docs_all = [doc.page_content for doc in docs]
+        docs_all = [doc.page_content for doc in docs]
 
-    embeddings = OpenAIEmbeddings()
-    db = Chroma.from_documents(docs, embedding=embeddings)
+        # ベクトル検索（OpenAIEmbeddings + Chroma エフェメラル）
+        embeddings = OpenAIEmbeddings()
+        db = Chroma.from_documents(docs, embedding=embeddings)
+        retriever_vec = db.as_retriever(search_kwargs={"k": ct.TOP_K})
 
-    retriever = db.as_retriever(search_kwargs={"k": ct.TOP_K})
+        # BM25（日本語前処理つき）
+        bm25 = BM25Retriever.from_texts(
+            docs_all,
+            preprocess_func=utils.preprocess_func,
+            k=ct.TOP_K
+        )
 
-    bm25_retriever = BM25Retriever.from_texts(
-        docs_all,
-        preprocess_func=utils.preprocess_func,
-        k=ct.TOP_K
-    )
-    ensemble_retriever = EnsembleRetriever(
-        retrievers=[bm25_retriever, retriever],
-        weights=ct.RETRIEVER_WEIGHTS
-    )
+        # アンサンブル
+        return EnsembleRetriever(
+            retrievers=[bm25, retriever_vec],
+            weights=ct.RETRIEVER_WEIGHTS
+        )
 
-    st.session_state.retriever = ensemble_retriever
+    st.session_state.retriever = _build_retriever(sig)
+    # ==== ここまでキャッシュ化 ====
+
 
 
 def adjust_string(s):

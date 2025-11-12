@@ -11,6 +11,11 @@ from glob import glob
 
 logger = logging.getLogger("app_logger")
 
+@st.cache_data(show_spinner=False)
+def _load_products_csv() -> pd.DataFrame:
+    csv_path = Path(__file__).resolve().parent / "data" / "products.csv"
+    return pd.read_csv(csv_path, dtype=str, encoding="utf-8")
+
 def display_app_title():
     st.markdown(f"## {ct.APP_NAME}")
 
@@ -58,16 +63,14 @@ def display_product(result):
 
     # ② 在庫バナー
     stock = (product.get("stock_status") or "").strip()
-    if not stock:
-        try:
-            csv_path = Path(__file__).resolve().parent / "data" / "products.csv"
-            if csv_path.exists():
-                df = pd.read_csv(csv_path, dtype=str, encoding="utf-8")
-                row = df[df["id"].astype(str) == str(product.get("id", ""))]
-                if not row.empty and "stock_status" in row.columns:
-                    stock = (row.iloc[0]["stock_status"] or "").strip()
-        except Exception as e:
-            logger.warning(f"stock_status lookup skipped: {e}")
+if not stock:
+    try:
+        df = _load_products_csv()
+        row = df[df["id"].astype(str) == str(product.get("id", ""))]
+        if not row.empty and "stock_status" in row.columns:
+            stock = (row.iloc[0]["stock_status"] or "").strip()
+    except Exception as e:
+        logger.warning(f"stock_status lookup skipped: {e}")
 
     if stock == ct.STOCK_LOW_TEXT:
         st.warning(f"{ct.WARNING_ICON} ご好評につき、在庫数が{ct.STOCK_LOW_TEXT}です。購入をご希望の場合、お早めのご注文をおすすめいたします。")
@@ -83,14 +86,13 @@ def display_product(result):
 
     # ④ 画像処理（CSVの file_name をIDで引き、複数フォルダ・拡張子・ゆるい一致で探索）
     file_name = ""
-    try:
-        csv_path = Path(__file__).resolve().parent / "data" / "products.csv"
-        df = pd.read_csv(csv_path, dtype=str, encoding="utf-8")
-        row = df[df["id"].astype(str) == str(product.get("id", ""))]
-        if not row.empty and "file_name" in row.columns:
-            file_name = str(row.iloc[0]["file_name"]).strip()
-    except Exception as e:
-        logger.warning(f"image lookup skipped: {e}")
+try:
+    df = _load_products_csv()
+    row = df[df["id"].astype(str) == str(product.get("id", ""))]
+    if not row.empty and "file_name" in row.columns:
+        file_name = str(row.iloc[0]["file_name"]).strip()
+except Exception as e:
+    logger.warning(f"image lookup skipped: {e}")
 
     # 探索ルートを複数用意（教材ごとに配置が違っても拾えるように）
     roots = [
