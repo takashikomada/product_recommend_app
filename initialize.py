@@ -1,3 +1,7 @@
+"""
+このファイルは、最初の画面読み込み時にのみ実行される初期化処理が記述されたファイルです。
+"""
+
 ############################################################
 # ライブラリの読み込み
 ############################################################
@@ -19,8 +23,6 @@ from langchain_community.retrievers import BM25Retriever
 from langchain_community.vectorstores import Chroma
 from langchain_openai import OpenAIEmbeddings
 from langchain.retrievers import EnsembleRetriever
-from chromadb import EphemeralClient
-from chromadb.config import Settings
 
 import utils
 import constants as ct
@@ -30,12 +32,12 @@ import constants as ct
 # 設定関連
 ############################################################
 ENV_PATH = Path(__file__).resolve().parent / ".env"
+# UTF-8 の .env を、このプロジェクト直下だけ読む
 load_dotenv(dotenv_path=ENV_PATH, encoding="utf-8", override=True)
 
+# （モジュール直下では st.* を呼ばない。ログだけ出す）
 logging.getLogger(ct.LOGGER_NAME).info(f"DEBUG: Using .env -> {ENV_PATH}")
-logging.getLogger(ct.LOGGER_NAME).info(
-    f"DEBUG: OPENAI_API_KEY loaded -> {bool(os.getenv('OPENAI_API_KEY'))}"
-)
+logging.getLogger(ct.LOGGER_NAME).info(f"DEBUG: OPENAI_API_KEY loaded -> {bool(os.getenv('OPENAI_API_KEY'))}")
 
 
 ############################################################
@@ -43,16 +45,25 @@ logging.getLogger(ct.LOGGER_NAME).info(
 ############################################################
 
 def initialize():
-    """画面読み込み時に実行する初期化処理"""
+    """
+    画面読み込み時に実行する初期化処理
+    """
+    # 初期化データの用意
     initialize_session_state()
+    # ログ出力用にセッションIDを生成
     initialize_session_id()
+    # ログ出力の設定
     initialize_logger()
+    # RAGのRetrieverを作成
     initialize_retriever()
 
 
 def initialize_logger():
-    """ログ出力の設定"""
+    """
+    ログ出力の設定
+    """
     os.makedirs(ct.LOG_DIR_PATH, exist_ok=True)
+    
     logger = logging.getLogger(ct.LOGGER_NAME)
     if logger.hasHandlers():
         return
@@ -63,8 +74,7 @@ def initialize_logger():
         encoding="utf8"
     )
     formatter = logging.Formatter(
-        f"[%(levelname)s] %(asctime)s line %(lineno)s, in %(funcName)s, "
-        f"session_id={st.session_state.session_id}: %(message)s"
+        f"[%(levelname)s] %(asctime)s line %(lineno)s, in %(funcName)s, session_id={st.session_state.session_id}: %(message)s"
     )
     log_handler.setFormatter(formatter)
     logger.setLevel(logging.INFO)
@@ -72,24 +82,30 @@ def initialize_logger():
 
 
 def initialize_session_id():
-    """セッションIDの作成"""
+    """
+    セッションIDの作成
+    """
     if "session_id" not in st.session_state:
         st.session_state.session_id = uuid4().hex
 
 
 def initialize_session_state():
-    """初期化データの用意"""
+    """
+    初期化データの用意
+    """
     if "messages" not in st.session_state:
         st.session_state.messages = []
 
 
 def initialize_retriever():
-    """Retrieverを作成（@st.cache_resource対応＋EphemeralClient対応＋フォールバック機構付き）"""
+    """
+    Retrieverを作成
+    """
     logger = logging.getLogger(ct.LOGGER_NAME)
     if "retriever" in st.session_state:
         return
 
-    # --- CSV 読み込み ---
+    # --- CSV 読み込み（文字コードを自動判定 → UTF-8正規化）---
     csv_path = Path(ct.RAG_SOURCE_PATH)
     tried = []
     df = None
@@ -102,20 +118,17 @@ def initialize_retriever():
 
     if df is None:
         logger.error(
-            "products.csv を読み込めませんでした。以下のエンコーディングで失敗: "
-            + " / ".join(tried)
+            "products.csv を読み込めませんでした。以下のエンコーディングで失敗: " + " / ".join(tried)
         )
         raise RuntimeError("products.csv の文字コードを UTF-8 へ保存し直してください。")
 
-    # ==== キャッシュ化 ====
+    # ==== ここからキャッシュ化 ====
     stat = csv_path.stat()
     sig = f"{stat.st_mtime_ns}:{stat.st_size}:{ct.TOP_K}:{tuple(ct.RETRIEVER_WEIGHTS)}:{bool(os.getenv('OPENAI_API_KEY'))}"
 
     @st.cache_resource(show_spinner=False)
     def _build_retriever(_signature: str):
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".csv", delete=False, encoding="utf-8", newline=""
-        ) as tmp:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False, encoding="utf-8", newline="") as tmp:
             tmp_path = Path(tmp.name)
             df.to_csv(tmp_path, index=False, encoding="utf-8")
 
@@ -128,7 +141,7 @@ def initialize_retriever():
             except Exception:
                 pass
 
-        # Windows化け対策
+        # Windowsの化け対策
         for doc in docs:
             doc.page_content = adjust_string(doc.page_content)
             for key in list(doc.metadata.keys()):
@@ -136,52 +149,33 @@ def initialize_retriever():
 
         docs_all = [doc.page_content for doc in docs]
 
-        # --- ベクトル検索（OpenAIEmbeddings + Chroma EphemeralClient）---
-        use_vec = bool(os.getenv("OPENAI_API_KEY"))
-        retriever_vec = None
-        if use_vec:
-            try:
-                embeddings = OpenAIEmbeddings()
-                client = EphemeralClient(Settings(anonymized_telemetry=False))
-                db = Chroma.from_documents(
-                    docs,
-                    embedding=embeddings,
-                    client=client
-                )
-                retriever_vec = db.as_retriever(search_kwargs={"k": ct.TOP_K})
-            except Exception as e:
-                logger.warning(f"vector retriever disabled: {e}")
-                retriever_vec = None
-                use_vec = False
+        embeddings = OpenAIEmbeddings()
+        db = Chroma.from_documents(docs, embedding=embeddings)
+        retriever_vec = db.as_retriever(search_kwargs={"k": ct.TOP_K})
 
-        # --- BM25（日本語前処理つき）---
         bm25 = BM25Retriever.from_texts(
             docs_all,
             preprocess_func=utils.preprocess_func,
             k=ct.TOP_K
         )
 
-        # --- アンサンブル or 単独BM25 ---
-        if use_vec and retriever_vec is not None:
-            logger.info("initialize_retriever(): retriever ready (ensemble)")
-            return EnsembleRetriever(
-                retrievers=[bm25, retriever_vec],
-                weights=ct.RETRIEVER_WEIGHTS
-            )
-        else:
-            logger.info("initialize_retriever(): retriever ready (BM25 only)")
-            return bm25
+        return EnsembleRetriever(
+            retrievers=[bm25, retriever_vec],
+            weights=ct.RETRIEVER_WEIGHTS
+        )
 
     st.session_state.retriever = _build_retriever(sig)
     # ==== ここまでキャッシュ化 ====
 
 
 def adjust_string(s):
-    """Windows環境でRAGが正常動作するよう調整"""
+    """
+    Windows環境でRAGが正常動作するよう調整
+    """
     if type(s) is not str:
         return s
+
     if sys.platform.startswith("win"):
         s = unicodedata.normalize("NFC", s)
-        s = s.encode("cp932", "ignore").decode("cp932")
-        return s
+        s = s.encode("cp932", "ignore").decode("cp932", "ignore")
     return s
