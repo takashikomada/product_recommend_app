@@ -1,7 +1,3 @@
-"""
-このファイルは、最初の画面読み込み時にのみ実行される初期化処理が記述されたファイルです。
-"""
-
 ############################################################
 # ライブラリの読み込み
 ############################################################
@@ -37,7 +33,9 @@ load_dotenv(dotenv_path=ENV_PATH, encoding="utf-8", override=True)
 
 # （モジュール直下では st.* を呼ばない。ログだけ出す）
 logging.getLogger(ct.LOGGER_NAME).info(f"DEBUG: Using .env -> {ENV_PATH}")
-logging.getLogger(ct.LOGGER_NAME).info(f"DEBUG: OPENAI_API_KEY loaded -> {bool(os.getenv('OPENAI_API_KEY'))}")
+logging.getLogger(ct.LOGGER_NAME).info(
+    f"DEBUG: OPENAI_API_KEY loaded -> {bool(os.getenv('OPENAI_API_KEY'))}"
+)
 
 
 ############################################################
@@ -48,13 +46,9 @@ def initialize():
     """
     画面読み込み時に実行する初期化処理
     """
-    # 初期化データの用意
     initialize_session_state()
-    # ログ出力用にセッションIDを生成
     initialize_session_id()
-    # ログ出力の設定
     initialize_logger()
-    # RAGのRetrieverを作成
     initialize_retriever()
 
 
@@ -63,7 +57,7 @@ def initialize_logger():
     ログ出力の設定
     """
     os.makedirs(ct.LOG_DIR_PATH, exist_ok=True)
-    
+
     logger = logging.getLogger(ct.LOGGER_NAME)
     if logger.hasHandlers():
         return
@@ -99,7 +93,7 @@ def initialize_session_state():
 
 def initialize_retriever():
     """
-    Retrieverを作成
+    Retrieverを作成（@st.cache_resource対応＋フォールバック機構付き）
     """
     logger = logging.getLogger(ct.LOGGER_NAME)
     if "retriever" in st.session_state:
@@ -124,12 +118,11 @@ def initialize_retriever():
 
     # ==== ここからキャッシュ化（同一セッション＆リランで再構築を防止）====
     stat = csv_path.stat()
-    # CSVのmtime/size + TOP_K + weights + APIキー有無をシグネチャに
     sig = f"{stat.st_mtime_ns}:{stat.st_size}:{ct.TOP_K}:{tuple(ct.RETRIEVER_WEIGHTS)}:{bool(os.getenv('OPENAI_API_KEY'))}"
 
     @st.cache_resource(show_spinner=False)
     def _build_retriever(_signature: str):
-        # UTF-8に正規化した一時CSVを作ってCSVLoaderで読む
+        # 一時CSVを作ってCSVLoaderで読む
         with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False, encoding="utf-8", newline="") as tmp:
             tmp_path = Path(tmp.name)
             df.to_csv(tmp_path, index=False, encoding="utf-8")
@@ -151,48 +144,49 @@ def initialize_retriever():
 
         docs_all = [doc.page_content for doc in docs]
 
-        # ベクトル検索（OpenAIEmbeddings + Chroma エフェメラル）
-        embeddings = OpenAIEmbeddings()
-        db = Chroma.from_documents(docs, embedding=embeddings)
-        retriever_vec = db.as_retriever(search_kwargs={"k": ct.TOP_K})
+        # --- ベクトル検索（OpenAIEmbeddings + Chroma エフェメラル）
+        use_vec = bool(os.getenv("OPENAI_API_KEY"))
+        retriever_vec = None
+        if use_vec:
+            try:
+                embeddings = OpenAIEmbeddings()
+                db = Chroma.from_documents(docs, embedding=embeddings)
+                retriever_vec = db.as_retriever(search_kwargs={"k": ct.TOP_K})
+            except Exception as e:
+                logger.warning(f"vector retriever disabled: {e}")
+                retriever_vec = None
+                use_vec = False
 
-        # BM25（日本語前処理つき）
+        # --- BM25（日本語前処理つき）
         bm25 = BM25Retriever.from_texts(
             docs_all,
             preprocess_func=utils.preprocess_func,
             k=ct.TOP_K
         )
 
-        # アンサンブル
-        return EnsembleRetriever(
-            retrievers=[bm25, retriever_vec],
-            weights=ct.RETRIEVER_WEIGHTS
-        )
+        # --- アンサンブル or 単独BM25 ---
+        if use_vec and retriever_vec is not None:
+            logger.info("initialize_retriever(): retriever ready (ensemble)")
+            return EnsembleRetriever(
+                retrievers=[bm25, retriever_vec],
+                weights=ct.RETRIEVER_WEIGHTS
+            )
+        else:
+            logger.info("initialize_retriever(): retriever ready (BM25 only)")
+            return bm25
 
     st.session_state.retriever = _build_retriever(sig)
     # ==== ここまでキャッシュ化 ====
 
 
-
 def adjust_string(s):
     """
     Windows環境でRAGが正常動作するよう調整
-    
-    Args:
-        s: 調整を行う文字列
-    
-    Returns:
-        調整を行った文字列
     """
-    # 調整対象は文字列のみ
     if type(s) is not str:
         return s
-
-    # OSがWindowsの場合、Unicode正規化と、cp932（Windows用の文字コード）で表現できない文字を除去
     if sys.platform.startswith("win"):
-        s = unicodedata.normalize('NFC', s)
+        s = unicodedata.normalize("NFC", s)
         s = s.encode("cp932", "ignore").decode("cp932")
         return s
-    
-    # OSがWindows以外の場合はそのまま返す
     return s
